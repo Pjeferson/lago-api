@@ -27,9 +27,6 @@ completa entre evento pai e eventos filhos.
 ---
 
 ## 🎥 Demonstração em vídeo
-
-![Walkthrough](walkthrough.png)
-
 ▶ Walkthrough completo no YouTube — clique na thumbnail abaixo para assistir:
 
 [![Demonstração em vídeo](https://img.youtube.com/vi/QIyx00X51kE/maxresdefault.jpg)](https://youtu.be/QIyx00X51kE)
