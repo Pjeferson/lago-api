@@ -55,6 +55,42 @@ original.
 5. Reportar essas descobertas antes de prosseguir para a implementação, para
    validação.
 
+## Achados confirmados — investigação técnica (Passo 1 concluído)
+
+Investigação realizada diretamente no código. Estes são os fatos reais, não suposições:
+
+1. **Classe real de criação de eventos**: `Events::CreateService < BaseService`
+   em `app/services/events/create_service.rb`. Construtor: `initialize(organization:, params:, timestamp:, metadata:)`.
+   Método de entrada: `call` (sem argumentos). Chamada via `.call(...)` (class method do BaseService).
+
+2. **Formato do Result**: `Result = BaseResult[:event]` — expõe `result.success?` e `result.event`.
+   O `result.event` é o model `Event` recém-persistido.
+
+3. **Idempotência confirmada pelo banco**:
+   `UNIQUE INDEX index_unique_transaction_id ON events(organization_id, external_subscription_id, transaction_id)`.
+   O `CreateService` já captura `RecordNotUnique` e retorna `value_already_exist` como validação de negócio
+   (não como exceção). O job usa `.call` (não `.call!`), portanto reprocessar o mesmo evento pai duas vezes
+   é um no-op silencioso — sem duplicatas, sem erros, sem tratamento adicional necessário.
+
+4. **Sem ClimateControl**: a gem não está disponível neste projeto. Para testar env vars nos specs,
+   usar mutação direta do ENV em blocos `around`:
+   `around { |ex| ENV["KYB_EXPANSION_ENABLED"] = "true"; ex.run; ENV.delete("KYB_EXPANSION_ENABLED") }`
+
+5. **Matcher de enfileiramento**: o projeto usa `have_enqueued_job(JobClass)` (não `have_been_enqueued`).
+   Referência: `spec/services/events/create_service_spec.rb:56`.
+
+6. **Sem loop infinito**: o prepend só dispara quando `result.event.code == "kyb_decision"`.
+   Eventos derivados têm code `"kyc_decision"` — nunca voltam a acionar o módulo.
+
+7. **`to_prepare` obrigatório**: o prepend deve ser aplicado dentro de
+   `Rails.application.config.to_prepare { ... }` no initializer — não no corpo do initializer —
+   porque em modo de desenvolvimento o Rails recarrega classes a cada request.
+
+8. **Factory de eventos**: `:event` em `spec/factories/events.rb`.
+   Aceita `organization_id`, `transaction_id`, `code`, `external_subscription_id`, `properties`.
+
+---
+
 ## Passo 2 — Estrutura de arquivos a criar
 
 ```
@@ -73,7 +109,8 @@ spec/kyb_expansion/kyb_expansion_job_spec.rb
 - Sobrescreve o método principal chamando `super` **primeiro, sempre**.
 - Após obter o resultado de `super`, verifica: se `result.success?` e o
   `code` do evento criado é `"kyb_decision"`, enfileira
-  `KybExpansion::KybExpansionJob.perform_async(result.event.id)`.
+  `KybExpansion::KybExpansionJob.perform_later(result.event.id)`.
+  (O projeto usa ActiveJob — `ApplicationJob < ActiveJob::Base` — não Sidekiq raw, portanto `perform_later`, não `perform_async`.)
 - Retorna exatamente o `result` original, sem modificação — a extensão nunca
   altera o comportamento observável do fluxo original para quem chamou a API.
 - Deve respeitar uma feature flag via variável de ambiente
