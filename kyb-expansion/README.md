@@ -32,6 +32,16 @@ completa entre evento pai e eventos filhos.
 
 ---
 
+## 🎥 Demonstração em vídeo
+
+![Walkthrough](walkthrough.png)
+
+▶ Walkthrough completo no YouTube — clique na thumbnail abaixo para assistir:
+
+[![Demonstração em vídeo](https://img.youtube.com/vi/QIyx00X51kE/maxresdefault.jpg)](https://youtu.be/QIyx00X51kE)
+
+---
+
 ## Princípio arquitetural: estender sem alterar o núcleo
 
 O Lago é mantido ativamente upstream (`getlago/lago-api`). Editar arquivos originais
@@ -264,9 +274,3 @@ Reenviar o mesmo `transaction_id` do evento pai não gerou duplicatas.
 ### Flag desligada
 
 Com `KYB_EXPANSION_ENABLED` ausente: nenhum evento `kyc_decision` derivado foi gerado.
-
----
-
-## Vídeo explicativo
-
-> 🎥 Vídeo: [link a adicionar]
