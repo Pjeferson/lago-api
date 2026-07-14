@@ -138,47 +138,38 @@ kyb-expansion/demo_catalog_setup.sh
 
 ### Pré-requisitos
 
-- Lago rodando via `docker-compose.dev.yml`
-- Catálogo de demo configurado:
+Este repo (`lago-api`) deve estar dentro de um fork do `lago` com a branch `kyb-expansion`
+que contém o override de docker-compose em `kyb-expansion/docker-compose.kyb-expansion.yml`.
+
+### Variáveis de ambiente
+
+Adicione em `lago/.env.development`:
 
 ```bash
-bash kyb-expansion/demo_catalog_setup.sh
+KYB_EXPANSION_ENABLED=true
+LAGO_KAFKA_KYB_DECISION_EVENTS_TOPIC=kyb_decision_events
+```
+
+### Subir o stack com o pipeline de filtragem
+
+A partir da pasta raiz `lago/`:
+
+```bash
+docker compose -f docker-compose.dev.yml -f kyb-expansion/docker-compose.kyb-expansion.yml up -d
+```
+
+Isso sobe o stack completo + dois serviços extras:
+- `kyb-expansion-topics` — cria o tópico `kyb_decision_events` (idempotente, encerra sozinho)
+- `kyb-expansion-filter` — Redpanda Connect lendo `events-raw` e escrevendo `kyb_decision_events`
+
+### Catálogo de demo
+
+```bash
+bash api/kyb-expansion/demo_catalog_setup.sh
 ```
 
 Cria: billable metrics (`kyb_decision`, `kyc_decision`, etc.), plano `identity_platform_demo`,
 cliente `demo_customer_001` com subscription `demo_customer_001_sub`.
-
-### Variáveis de ambiente necessárias
-
-```bash
-# Feature flag
-KYB_EXPANSION_ENABLED=true
-
-# Tópico Kafka pré-filtrado (criado pelo pipeline Redpanda Connect)
-LAGO_KAFKA_KYB_DECISION_EVENTS_TOPIC=kyb_decision_events
-```
-
-### Iniciar o pipeline de filtragem
-
-```bash
-docker run --rm \
-  --network lago_dev \
-  -e LAGO_KAFKA_BOOTSTRAP_SERVERS=redpanda:9092 \
-  -e LAGO_KAFKA_RAW_EVENTS_TOPIC=raw_events \
-  -e LAGO_KAFKA_KYB_DECISION_EVENTS_TOPIC=kyb_decision_events \
-  -v $(pwd)/kyb-expansion/redpanda_connect_kyb_filter.yaml:/etc/connect.yaml \
-  docker.redpanda.com/redpandadata/connect:latest \
-  run /etc/connect.yaml
-```
-
-### Ativar o consumer e reiniciar
-
-```bash
-echo "KYB_EXPANSION_ENABLED=true" >> api/.env.development
-echo "LAGO_KAFKA_KYB_DECISION_EVENTS_TOPIC=kyb_decision_events" >> api/.env.development
-lago restart api
-lago restart api-worker
-```
 
 ### Rodar os testes
 

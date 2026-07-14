@@ -51,7 +51,7 @@ class KarafkaApp < Karafka::App
       consumer_group :kyb_expansion_kyb_decision_consumer do
         topic ENV["LAGO_KAFKA_KYB_DECISION_EVENTS_TOPIC"] do
           consumer KybExpansion::KybDecisionEventConsumer
-          dead_letter_queue(topic: "unprocessed_events", max_retries: 1, independent: true, dispatch_method: :produce_sync)
+          dead_letter_queue(topic: ENV.fetch("LAGO_KAFKA_EVENTS_DEAD_LETTER_TOPIC", "unprocessed_events"), max_retries: 1, independent: true, dispatch_method: :produce_sync)
         end
       end
     end
