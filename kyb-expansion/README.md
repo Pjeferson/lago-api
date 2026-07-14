@@ -45,9 +45,27 @@ Isso permite sincronizar com o upstream com `git merge main` sem conflitos estru
 
 ---
 
+## Duas implementações incluídas
+
+Este repositório contém **duas implementações independentes** da mesma extensão, para fins comparativos:
+
+| | Abordagem 1: `Module#prepend` | Abordagem 2: Kafka Consumer |
+|---|---|---|
+| **Trigger** | In-process, dentro do request HTTP | Assíncrono, via mensagem Kafka |
+| **Cobre single event** | ✅ | ✅ |
+| **Cobre batch event** | ❌ | ✅ |
+| **Cobre ClickHouse store** | ✅ | ✅ |
+| **Dependência de infra** | Nenhuma | Kafka/Redpanda rodando |
+| **Arquivo de borda** | `config/initializers/kyb_expansion.rb` | `karafka.rb` (8 linhas) |
+| **Job** | `KybExpansionJob` (recebe `event.id`) | `KybExpansionFromPayloadJob` (recebe payload Kafka) |
+
+Ambas são ativadas pela mesma flag `KYB_EXPANSION_ENABLED=true`. Se ambas estiverem ativas simultaneamente, a idempotência garantida pelo índice único do banco impede duplicação — a segunda execução é silenciosamente descartada.
+
+---
+
 ## Como funciona tecnicamente
 
-### Ponto de extensão
+### Abordagem 1: Ponto de extensão via prepend
 
 O initializer `config/initializers/kyb_expansion.rb` usa
 `Rails.application.config.to_prepare` (e não o corpo do initializer diretamente)
@@ -75,6 +93,20 @@ end
 A guarda em `code == "kyb_decision"` previne loop infinito: os eventos derivados têm
 code `"kyc_decision"` e não voltam a disparar o módulo.
 
+### Abordagem 2: Kafka Consumer
+
+`KybExpansion::KybDecisionEventConsumer` consome o tópico `LAGO_KAFKA_RAW_EVENTS_TOPIC` — o mesmo tópico para o qual o `Events::KafkaProducerService` publica **todos** os eventos recebidos, independentemente de serem single ou batch e de qual store (PostgreSQL ou ClickHouse) está sendo usado. O consumer usa seu próprio consumer group (`kyb_expansion_kyb_decision_consumer`), garantindo offset independente e sem interferência com outros consumers do Lago.
+
+Fluxo:
+1. `POST /api/v1/events` (single) **ou** `POST /api/v1/events/batch` → `KafkaProducerService` publica no tópico
+2. `KybDecisionEventConsumer#consume` filtra por `code == "kyb_decision"` e `KYB_EXPANSION_ENABLED`
+3. Enfileira `KybExpansionFromPayloadJob` com o payload JSON da mensagem
+4. O job usa os campos do payload diretamente — sem precisar carregar o `Event` do banco, funciona com ClickHouse store também
+
+O registro do consumer em `karafka.rb` é a única edição num arquivo original do Lago (8 linhas, gated em `LAGO_KAFKA_RAW_EVENTS_TOPIC`).
+
+---
+
 ### O job assíncrono (`app/jobs/kyb_expansion/kyb_expansion_job.rb`)
 
 `KybExpansion::KybExpansionJob` roda na fila `:events` (mesma fila já usada pelo
@@ -97,13 +129,23 @@ O banco já impõe `UNIQUE INDEX index_unique_transaction_id ON events(organizat
 ## Estrutura de arquivos da extensão
 
 ```
-config/initializers/kyb_expansion.rb              # ponto de conexão (único arquivo "de borda")
-app/services/kyb_expansion/expand_kyb_decision.rb # módulo de prepend
-app/jobs/kyb_expansion/kyb_expansion_job.rb       # job assíncrono de expansão
-spec/kyb_expansion/expand_kyb_decision_spec.rb    # testes do prepend
-spec/kyb_expansion/kyb_expansion_job_spec.rb      # testes do job
-kyb-expansion/README.md                           # esta documentação
-kyb-expansion/demo_catalog_setup.sh               # script de setup do catálogo de demo
+# Abordagem 1 — prepend
+config/initializers/kyb_expansion.rb                        # ponto de conexão via to_prepare
+app/services/kyb_expansion/expand_kyb_decision.rb           # módulo de prepend
+app/jobs/kyb_expansion/kyb_expansion_job.rb                 # job (recebe event.id do DB)
+spec/kyb_expansion/expand_kyb_decision_spec.rb
+spec/kyb_expansion/kyb_expansion_job_spec.rb
+
+# Abordagem 2 — Kafka consumer
+karafka.rb                                                  # +8 linhas de rota (único arquivo core editado)
+app/consumers/kyb_expansion/kyb_decision_event_consumer.rb  # consumer
+app/jobs/kyb_expansion/kyb_expansion_from_payload_job.rb    # job (recebe payload Kafka)
+spec/kyb_expansion/kyb_decision_event_consumer_spec.rb
+spec/kyb_expansion/kyb_expansion_from_payload_job_spec.rb
+
+# Documentação
+kyb-expansion/README.md
+kyb-expansion/demo_catalog_setup.sh
 ```
 
 ---

@@ -46,6 +46,17 @@ class KarafkaApp < Karafka::App
     Rails.logger.error("Karafka producer error: #{event[:error].message}")
   end
 
+  if ENV["LAGO_KAFKA_RAW_EVENTS_TOPIC"].present?
+    routes.draw do
+      consumer_group :kyb_expansion_kyb_decision_consumer do
+        topic ENV["LAGO_KAFKA_RAW_EVENTS_TOPIC"] do
+          consumer KybExpansion::KybDecisionEventConsumer
+          dead_letter_queue(topic: "unprocessed_events", max_retries: 1, independent: true, dispatch_method: :produce_sync)
+        end
+      end
+    end
+  end
+
   if ENV["LAGO_KAFKA_EVENTS_CHARGED_IN_ADVANCE_TOPIC"].present?
     routes.draw do
       consumer_group :lago_events_charged_in_advance_consumer do
