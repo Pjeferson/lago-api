@@ -1,4 +1,4 @@
-# KybExpansion
+# KYBExpansion
 
 > Extensão de estudo sobre o Lago (usage-based billing open source), demonstrando como
 > estender o sistema sem modificar nenhum arquivo original — princípio "fork e estende,
