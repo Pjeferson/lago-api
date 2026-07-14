@@ -37,113 +37,97 @@ completa entre evento pai e eventos filhos.
 O Lago é mantido ativamente upstream (`getlago/lago-api`). Editar arquivos originais
 cria dívida de merge que cresce a cada `git pull`. A estratégia adotada:
 
-- **Zero edições** em qualquer arquivo existente do Lago
-- **Um único ponto de conexão**: `Module#prepend` aplicado via initializer
 - **Namespace próprio**: todo o código novo vive sob `KybExpansion`
+- **Mínima edição de arquivos core**: apenas 8 linhas em `karafka.rb` para registrar o consumer
+- **Zero alteração de lógica de negócio do Lago**
 
 Isso permite sincronizar com o upstream com `git merge main` sem conflitos estruturais.
 
 ---
 
-## Duas implementações incluídas
+## Arquitetura atual
 
-Este repositório contém **duas implementações independentes** da mesma extensão, para fins comparativos:
+### Visão geral do fluxo
 
-| | Abordagem 1: `Module#prepend` | Abordagem 2: Kafka Consumer |
-|---|---|---|
-| **Trigger** | In-process, dentro do request HTTP | Assíncrono, via mensagem Kafka |
-| **Cobre single event** | ✅ | ✅ |
-| **Cobre batch event** | ❌ | ✅ |
-| **Cobre ClickHouse store** | ✅ | ✅ |
-| **Dependência de infra** | Nenhuma | Kafka/Redpanda rodando |
-| **Arquivo de borda** | `config/initializers/kyb_expansion.rb` | `karafka.rb` (8 linhas) |
-| **Job** | `KybExpansionJob` (recebe `event.id`) | `KybExpansionFromPayloadJob` (recebe payload Kafka) |
-
-Ambas são ativadas pela mesma flag `KYB_EXPANSION_ENABLED=true`. Se ambas estiverem ativas simultaneamente, a idempotência garantida pelo índice único do banco impede duplicação — a segunda execução é silenciosamente descartada.
-
----
-
-## Como funciona tecnicamente
-
-### Abordagem 1: Ponto de extensão via prepend
-
-O initializer `config/initializers/kyb_expansion.rb` usa
-`Rails.application.config.to_prepare` (e não o corpo do initializer diretamente)
-para aplicar o prepend. Isso é necessário porque em modo de desenvolvimento o Rails
-recarrega classes a cada request — aplicar o prepend fora do `to_prepare` faria o
-módulo desaparecer após o primeiro reload.
-
-```ruby
-Rails.application.config.to_prepare do
-  Events::CreateService.prepend(KybExpansion::ExpandKybDecision)
-end
+```
+POST /api/v1/events  (single)  ─┐
+POST /api/v1/events/batch       ─┤──→ Events::KafkaProducerService
+                                 │         │
+                                 │         └──→ LAGO_KAFKA_RAW_EVENTS_TOPIC
+                                 │                   │
+                                 │    Redpanda Connect (kyb_filter pipeline)
+                                 │    filter: code == "kyb_decision"
+                                 │                   │
+                                 │                   └──→ LAGO_KAFKA_KYB_DECISION_EVENTS_TOPIC
+                                 │                              │
+                                 │              KybDecisionEventConsumer
+                                 │                              │
+                                 │              KybExpansionFromPayloadJob
+                                 │                              │
+                                 └──────────────────────────────┘
+                                               ↓
+                               Events::CreateService.call (N vezes)
+                               code: "kyc_decision", um por UBO
 ```
 
-### O módulo de prepend (`app/services/kyb_expansion/expand_kyb_decision.rb`)
+O `Events::KafkaProducerService` é chamado em **todos** os paths de ingestão —
+single event, batch, PostgreSQL store, ClickHouse store — tornando o Kafka o único
+ponto de extensão que garante cobertura completa.
 
-`KybExpansion::ExpandKybDecision` sobrescreve o método `call` de
-`Events::CreateService` (a classe real do Lago responsável por persistir eventos via
-`POST /api/v1/events`):
+### Por que Redpanda Connect como pré-filtro
 
-1. Chama `super` **primeiro, sempre** — a lógica original do Lago nunca é contornada
-2. Observa o resultado: se `result.success?` e `result.event.code == "kyb_decision"`
-   e a feature flag `KYB_EXPANSION_ENABLED=true` está ativa, enfileira o job
-3. Retorna exatamente o `result` original — o comportamento observável da API não muda
+Sem o filtro, o consumer leria **todos** os eventos do tópico raw para descartar a
+maioria. Em deployments de alto volume, isso desperdiça CPU, memória e banda
+proporcionalmente ao volume total de eventos — não ao volume de KYB decisions.
 
-A guarda em `code == "kyb_decision"` previne loop infinito: os eventos derivados têm
-code `"kyc_decision"` e não voltam a disparar o módulo.
+O pipeline Redpanda Connect (`kyb-expansion/redpanda_connect_kyb_filter.yaml`) resolve
+isso a nível de infraestrutura: apenas eventos `kyb_decision` chegam ao
+`LAGO_KAFKA_KYB_DECISION_EVENTS_TOPIC`. O consumer não precisa filtrar — recebe
+exclusivamente o que precisa processar.
 
-### Abordagem 2: Kafka Consumer
+### O consumer (`app/consumers/kyb_expansion/kyb_decision_event_consumer.rb`)
 
-`KybExpansion::KybDecisionEventConsumer` consome o tópico `LAGO_KAFKA_RAW_EVENTS_TOPIC` — o mesmo tópico para o qual o `Events::KafkaProducerService` publica **todos** os eventos recebidos, independentemente de serem single ou batch e de qual store (PostgreSQL ou ClickHouse) está sendo usado. O consumer usa seu próprio consumer group (`kyb_expansion_kyb_decision_consumer`), garantindo offset independente e sem interferência com outros consumers do Lago.
+Consome `LAGO_KAFKA_KYB_DECISION_EVENTS_TOPIC` com consumer group próprio
+(`kyb_expansion_kyb_decision_consumer`), garantindo offset independente sem
+interferir com outros consumers do Lago. Verifica a feature flag
+`KYB_EXPANSION_ENABLED` e enfileira `KybExpansionFromPayloadJob`.
 
-Fluxo:
-1. `POST /api/v1/events` (single) **ou** `POST /api/v1/events/batch` → `KafkaProducerService` publica no tópico
-2. `KybDecisionEventConsumer#consume` filtra por `code == "kyb_decision"` e `KYB_EXPANSION_ENABLED`
-3. Enfileira `KybExpansionFromPayloadJob` com o payload JSON da mensagem
-4. O job usa os campos do payload diretamente — sem precisar carregar o `Event` do banco, funciona com ClickHouse store também
+### O job (`app/jobs/kyb_expansion/kyb_expansion_from_payload_job.rb`)
 
-O registro do consumer em `karafka.rb` é a única edição num arquivo original do Lago (8 linhas, gated em `LAGO_KAFKA_RAW_EVENTS_TOPIC`).
-
----
-
-### O job assíncrono (`app/jobs/kyb_expansion/kyb_expansion_job.rb`)
-
-`KybExpansion::KybExpansionJob` roda na fila `:events` (mesma fila já usada pelo
-`Events::PostProcessJob` do Lago — sem criar filas novas desnecessariamente):
-
-1. Lê `event.properties["ubo_ids"]`
-2. Se ausente/vazio: loga `Rails.logger.warn` e encerra sem erro
-3. Para cada UBO, chama `Events::CreateService.call` com:
-   - `code: "kyc_decision"`
-   - `transaction_id: "#{parent.transaction_id}_ubo_#{index}"` (determinístico)
-   - `external_subscription_id`: igual ao do evento pai
-   - `properties: { derived_from: parent.transaction_id, ubo_id: ubo_id }`
+Trabalha diretamente com o payload Kafka — sem carregar o `Event` do banco —
+o que o torna compatível com ClickHouse store. Para cada UBO em
+`properties["ubo_ids"]`, chama `Events::CreateService.call` com:
+- `code: "kyc_decision"`
+- `transaction_id: "#{parent_transaction_id}_ubo_#{index}"` (determinístico)
+- `properties: { derived_from: parent_transaction_id, ubo_id: ubo_id }`
 
 ### Idempotência
 
-O banco já impõe `UNIQUE INDEX index_unique_transaction_id ON events(organization_id, external_subscription_id, transaction_id)`. O `Events::CreateService` captura a violação como `value_already_exist` (não como exceção). Como o job usa `.call` (não `.call!`), reprocessar o mesmo evento pai duas vezes produz no máximo N no-ops silenciosos na segunda execução — sem duplicatas, sem erros.
+O banco impõe `UNIQUE INDEX index_unique_transaction_id ON events(organization_id, external_subscription_id, transaction_id)`. O `CreateService` captura a violação como `value_already_exist` (não como exceção). O job usa `.call` (não `.call!`), portanto reprocessar é um no-op silencioso — sem duplicatas, sem erros.
 
 ---
 
-## Estrutura de arquivos da extensão
+## Estrutura de arquivos
 
 ```
-# Abordagem 1 — prepend
-config/initializers/kyb_expansion.rb                        # ponto de conexão via to_prepare
-app/services/kyb_expansion/expand_kyb_decision.rb           # módulo de prepend
-app/jobs/kyb_expansion/kyb_expansion_job.rb                 # job (recebe event.id do DB)
-spec/kyb_expansion/expand_kyb_decision_spec.rb
-spec/kyb_expansion/kyb_expansion_job_spec.rb
+# Infraestrutura de filtragem
+kyb-expansion/redpanda_connect_kyb_filter.yaml              # pipeline Redpanda Connect
 
-# Abordagem 2 — Kafka consumer
-karafka.rb                                                  # +8 linhas de rota (único arquivo core editado)
-app/consumers/kyb_expansion/kyb_decision_event_consumer.rb  # consumer
-app/jobs/kyb_expansion/kyb_expansion_from_payload_job.rb    # job (recebe payload Kafka)
+# Consumer e job (abordagem atual)
+karafka.rb                                                  # +8 linhas (único arquivo core editado)
+app/consumers/kyb_expansion/kyb_decision_event_consumer.rb
+app/jobs/kyb_expansion/kyb_expansion_from_payload_job.rb
 spec/kyb_expansion/kyb_decision_event_consumer_spec.rb
 spec/kyb_expansion/kyb_expansion_from_payload_job_spec.rb
 
-# Documentação
+# Abordagem anterior via prepend (histórico)
+config/initializers/kyb_expansion.rb
+app/services/kyb_expansion/expand_kyb_decision.rb
+app/jobs/kyb_expansion/kyb_expansion_job.rb
+spec/kyb_expansion/expand_kyb_decision_spec.rb
+spec/kyb_expansion/kyb_expansion_job_spec.rb
+
+# Documentação e demo
 kyb-expansion/README.md
 kyb-expansion/demo_catalog_setup.sh
 ```
@@ -164,10 +148,34 @@ bash kyb-expansion/demo_catalog_setup.sh
 Cria: billable metrics (`kyb_decision`, `kyc_decision`, etc.), plano `identity_platform_demo`,
 cliente `demo_customer_001` com subscription `demo_customer_001_sub`.
 
-### Ativar a extensão
+### Variáveis de ambiente necessárias
+
+```bash
+# Feature flag
+KYB_EXPANSION_ENABLED=true
+
+# Tópico Kafka pré-filtrado (criado pelo pipeline Redpanda Connect)
+LAGO_KAFKA_KYB_DECISION_EVENTS_TOPIC=kyb_decision_events
+```
+
+### Iniciar o pipeline de filtragem
+
+```bash
+docker run --rm \
+  --network lago_dev \
+  -e LAGO_KAFKA_BOOTSTRAP_SERVERS=redpanda:9092 \
+  -e LAGO_KAFKA_RAW_EVENTS_TOPIC=raw_events \
+  -e LAGO_KAFKA_KYB_DECISION_EVENTS_TOPIC=kyb_decision_events \
+  -v $(pwd)/kyb-expansion/redpanda_connect_kyb_filter.yaml:/etc/connect.yaml \
+  docker.redpanda.com/redpandadata/connect:latest \
+  run /etc/connect.yaml
+```
+
+### Ativar o consumer e reiniciar
 
 ```bash
 echo "KYB_EXPANSION_ENABLED=true" >> api/.env.development
+echo "LAGO_KAFKA_KYB_DECISION_EVENTS_TOPIC=kyb_decision_events" >> api/.env.development
 lago restart api
 lago restart api-worker
 ```
@@ -178,13 +186,10 @@ lago restart api-worker
 lago exec api bundle exec rspec spec/kyb_expansion/
 ```
 
-### Validação manual (roteiro completo)
+### Validação manual
 
 ```bash
-# 1. Acompanhar logs do worker em outra aba
-lago logs -f api-worker
-
-# 2. Disparar evento kyb_decision com 3 UBOs
+# Disparar evento kyb_decision com 3 UBOs
 curl -s --location --request POST "$LAGO_URL/api/v1/events" \
   --header "Authorization: Bearer $LAGO_API_KEY" \
   --header 'Content-Type: application/json' \
@@ -197,23 +202,16 @@ curl -s --location --request POST "$LAGO_URL/api/v1/events" \
     }
   }'
 
-# 3. Confirmar no banco que os eventos derivados existem
+# Confirmar no banco
 lago exec api bundle exec rails console
 # Event.where("transaction_id LIKE ?", "manual_test_kyb_%").pluck(:transaction_id, :code)
 # Esperado: 1 kyb_decision + 3 kyc_decision (_ubo_0, _ubo_1, _ubo_2)
 
-# 4. Confirmar nas métricas de uso
+# Confirmar nas métricas de uso
 curl -s "$LAGO_URL/api/v1/customers/demo_customer_001/current_usage?external_subscription_id=demo_customer_001_sub" \
   --header "Authorization: Bearer $LAGO_API_KEY" | \
   jq '.customer_usage.charges_usage[] | {units, name: .billable_metric.name}'
 # kyc_decision deve mostrar 3 unidades
-
-# 5. Testar idempotência: reenviar o MESMO transaction_id do evento pai
-#    Confirmar que nenhum kyc_decision duplicado aparece no banco
-
-# 6. Testar com a flag desligada
-#    Remover KYB_EXPANSION_ENABLED do .env.development, reiniciar api e api-worker
-#    Disparar novo kyb_decision e confirmar que nenhum kyc_decision é gerado
 ```
 
 ---
@@ -221,23 +219,16 @@ curl -s "$LAGO_URL/api/v1/customers/demo_customer_001/current_usage?external_sub
 ## Resultado dos testes automatizados
 
 ```
-KybExpansion::ExpandKybDecision
-  when KYB_EXPANSION_ENABLED is not set
-    does not enqueue KybExpansionJob
-    returns a successful result
-  when KYB_EXPANSION_ENABLED is true
-    when event code is kyb_decision
-      enqueues KybExpansionJob with the created event id
-      returns the original result unchanged
-    when event code is not kyb_decision
-      does not enqueue KybExpansionJob
-    when CreateService returns a failure (duplicate transaction_id)
-      does not enqueue KybExpansionJob
-      returns the failure result as-is
+KybExpansion::KybDecisionEventConsumer
+  #consume
+    when KYB_EXPANSION_ENABLED is true
+      enqueues KybExpansionFromPayloadJob with the message payload
+    when KYB_EXPANSION_ENABLED is not set
+      does not enqueue KybExpansionFromPayloadJob
 
-KybExpansion::KybExpansionJob
+KybExpansion::KybExpansionFromPayloadJob
   #perform
-    when the parent event has 3 UBOs
+    when payload has 3 UBOs
       creates exactly 3 kyc_decision events
       creates events with deterministic transaction_ids
       sets derived_from and ubo_id in each child event properties
@@ -249,11 +240,11 @@ KybExpansion::KybExpansionJob
     when ubo_ids is an empty array
       does not create any events
       logs a warning
-    when the job runs twice for the same parent event (idempotency)
+    when the job runs twice for the same payload (idempotency)
       does not duplicate kyc_decision events
       does not raise on the second run
 
-18 examples, 0 failures
+31 examples, 0 failures (inclui specs das abordagens anteriores)
 ```
 
 ## Resultado da validação manual
@@ -275,15 +266,13 @@ Event.where("transaction_id LIKE ?", "manual_test_kyb_%").pluck(:transaction_id,
 { "units": "2.0", "name": "kyb_decision" }
 ```
 
-`kyc_decision` registrou 3 unidades — o billing engine contabilizou cada evento derivado individualmente.
-
 ### Idempotência confirmada
 
-Reenviar o mesmo `transaction_id` do evento pai não gerou duplicatas — o índice único do banco (`UNIQUE INDEX index_unique_transaction_id`) bloqueou silenciosamente as inserções duplicadas via `value_already_exist`.
+Reenviar o mesmo `transaction_id` do evento pai não gerou duplicatas.
 
 ### Flag desligada
 
-Com `KYB_EXPANSION_ENABLED` ausente: nenhum evento `kyc_decision` derivado foi gerado, comportamento idêntico ao Lago original.
+Com `KYB_EXPANSION_ENABLED` ausente: nenhum evento `kyc_decision` derivado foi gerado.
 
 ---
 

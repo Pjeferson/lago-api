@@ -1,0 +1,40 @@
+# Redpanda Connect pipeline — KYB Decision Event Filter
+#
+# Reads all raw events from LAGO_KAFKA_RAW_EVENTS_TOPIC, filters for
+# code == "kyb_decision" using a Bloblang mapping, and republishes only
+# those events to LAGO_KAFKA_KYB_DECISION_EVENTS_TOPIC.
+#
+# This pre-filtering means KybDecisionEventConsumer reads a low-volume
+# dedicated topic instead of consuming and discarding the full raw event
+# stream — eliminating the overhead that would exist in high-volume deployments.
+#
+# Usage (development, connecting to the lago_dev docker network):
+#
+#   docker run --rm \
+#     --network lago_dev \
+#     -e LAGO_KAFKA_BOOTSTRAP_SERVERS=redpanda:9092 \
+#     -e LAGO_KAFKA_RAW_EVENTS_TOPIC=raw_events \
+#     -e LAGO_KAFKA_KYB_DECISION_EVENTS_TOPIC=kyb_decision_events \
+#     -v $(pwd)/kyb-expansion/redpanda_connect_kyb_filter.yaml:/etc/connect.yaml \
+#     docker.redpanda.com/redpandadata/connect:latest \
+#     run /etc/connect.yaml
+
+input:
+  kafka_franz:
+    seed_brokers:
+      - "${LAGO_KAFKA_BOOTSTRAP_SERVERS}"
+    topics:
+      - "${LAGO_KAFKA_RAW_EVENTS_TOPIC}"
+    consumer_group: kyb_expansion_filter_group
+    start_from_oldest: false
+
+pipeline:
+  processors:
+    - mapping: |
+        root = if this.code == "kyb_decision" { this } else { deleted() }
+
+output:
+  kafka_franz:
+    seed_brokers:
+      - "${LAGO_KAFKA_BOOTSTRAP_SERVERS}"
+    topic: "${LAGO_KAFKA_KYB_DECISION_EVENTS_TOPIC}"
