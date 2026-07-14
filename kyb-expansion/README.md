@@ -6,12 +6,6 @@
 
 ---
 
-## Status
-
-Projeto pessoal de estudo técnico.
-
----
-
 ## O problema de negócio modelado
 
 Em produtos de verificação de identidade B2B (KYC/KYB), uma decisão de **KYB**
